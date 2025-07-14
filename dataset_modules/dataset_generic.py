@@ -7,10 +7,12 @@ import re
 import pdb
 import pickle
 from scipy import stats
-
+from glob import glob
+import random
+from PIL import Image
+from torchvision import transforms
 from torch.utils.data import Dataset
 import h5py
-
 from utils.utils import generate_split, nth
 
 def save_splits(split_datasets, column_keys, filename, boolean_style=False):
@@ -27,6 +29,98 @@ def save_splits(split_datasets, column_keys, filename, boolean_style=False):
 
 	df.to_csv(filename)
 	print()
+
+
+class CLAM_MammoDataset(Dataset):
+    def __init__(self, data_dir, split, seg_sess, pre_seg, cnn, pre_cnn,
+                 feat_dim=1024, patch_size=64, overlap=0., coverage_thresh=0.5,
+                 max_patches=None, shuffle=True, device='cpu'):
+
+        self.seg = seg_sess
+        self.pre_seg = pre_seg
+        self.cnn = cnn.to(device).eval()
+        self.pre_cnn = pre_cnn
+        self.device = device
+        self.feat_dim = feat_dim
+        self.patch_size = patch_size
+        self.stride = patch_size - int(overlap * patch_size)
+        self.coverage_thresh = coverage_thresh
+        self.max_patches = max_patches
+        self.shuffle = shuffle
+        self.data_dir = data_dir
+
+        exts = ('.png', '.jpg', '.jpeg', '.tif', '.tiff')
+        self.slides = sorted([
+            p for p in glob(os.path.join(data_dir, 'images', split, '*.*'))
+            if p.lower().endswith(exts)
+        ])
+
+        # --- Build slide_data for CLAM compatibility ---
+        slide_ids = [os.path.splitext(os.path.basename(p))[0] for p in self.slides]
+        labels = [
+            1 if os.path.exists(p.replace('images', 'labels').rsplit('.', 1)[0] + '.txt') and
+                 os.path.getsize(p.replace('images', 'labels').rsplit('.', 1)[0] + '.txt') > 0
+            else 0
+            for p in self.slides
+        ]
+        self.slide_data = pd.DataFrame({
+            'slide_id': slide_ids,
+            'label': labels
+        })
+        self.slide_data['case_id'] = self.slide_data['slide_id']  # dummy case ID
+
+        # --- Setup slide_cls_ids for weighted sampling ---
+        self.num_classes = len(set(labels))
+        self.slide_cls_ids = [[] for _ in range(self.num_classes)]
+        for i, lbl in enumerate(labels):
+            self.slide_cls_ids[int(lbl)].append(i)
+
+    def __len__(self):
+        return len(self.slides)
+
+    def __getitem__(self, idx):
+        path = self.slides[idx]
+        label = self.slide_data.loc[idx, 'label']
+        label = torch.tensor(label).long()
+
+        img = Image.open(path).convert('RGB')
+        gray = img.convert('L')
+        w, h = gray.size
+
+        if w >= h or (min(w, h) < 512 and max(w, h) < 1000):
+            return torch.zeros((0, self.feat_dim)), label
+
+        inp = self.pre_seg(gray).unsqueeze(0).numpy()
+        out = self.seg.run(None, {'input': inp})[0]
+        prob = torch.from_numpy(out[0])
+        mask = (prob.sigmoid() > 0.5).float()
+        mask = transforms.ToPILImage()(mask).resize((w, h), Image.NEAREST)
+        mask = np.array(mask) > 0
+
+        coords = [
+            (x, y)
+            for y in range(0, h - self.patch_size + 1, self.stride)
+            for x in range(0, w - self.patch_size + 1, self.stride)
+            if mask[y:y + self.patch_size, x:x + self.patch_size].mean() >= self.coverage_thresh
+        ]
+        if self.shuffle:
+            random.shuffle(coords)
+        if self.max_patches and len(coords) > self.max_patches:
+            coords = coords[:self.max_patches]
+        if not coords:
+            return torch.zeros((0, self.feat_dim)), label
+
+        patches = [self.pre_cnn(img.crop((x, y, x + self.patch_size, y + self.patch_size))) for x, y in coords]
+        batch = torch.stack(patches, dim=0).to(self.device)
+
+        with torch.no_grad():
+            features = self.cnn(batch)
+
+        return features.cpu(), label
+	
+    def getlabel(self, ids):
+        return self.slide_data['label'][ids]
+
 
 class Generic_WSI_Classification_Dataset(Dataset):
 	def __init__(self,
@@ -364,6 +458,3 @@ class Generic_Split(Generic_MIL_Dataset):
 
 	def __len__(self):
 		return len(self.slide_data)
-		
-
-
