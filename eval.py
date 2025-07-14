@@ -11,7 +11,9 @@ import pandas as pd
 from utils.utils import *
 from math import floor
 import matplotlib.pyplot as plt
-from dataset_modules.dataset_generic import Generic_WSI_Classification_Dataset, Generic_MIL_Dataset, save_splits
+import onnxruntime as ort
+from torchvision import transforms, models
+from dataset_modules.dataset_generic import Generic_WSI_Classification_Dataset, Generic_MIL_Dataset, save_splits, CLAM_MammoDataset
 import h5py
 from utils.eval_utils import *
 
@@ -69,39 +71,44 @@ with open(args.save_dir + '/eval_experiment_{}.txt'.format(args.save_exp_code), 
     print(settings, file=f)
 f.close()
 
-print(settings)
-if args.task == 'task_1_tumor_vs_normal':
-    args.n_classes=2
-    dataset = Generic_MIL_Dataset(csv_path = 'dataset_csv/tumor_vs_normal_dummy_clean.csv',
-                            data_dir= os.path.join(args.data_root_dir, 'tumor_vs_normal_resnet_features'),
-                            shuffle = False, 
-                            print_info = True,
-                            label_dict = {'normal_tissue':0, 'tumor_tissue':1},
-                            patient_strat=False,
-                            ignore=[])
+args.n_classes=2
+# Setup segmentation + feature extraction
+onnx_session = ort.InferenceSession(
+    "/home/parsa/preprocessing-changes-object/mg-cancer-experimentation/clam/segmentation.onnx",
+    providers=['CUDAExecutionProvider', 'CPUExecutionProvider']
+)
+preprocess_for_onnx = transforms.Compose([
+    transforms.Resize((256, 256)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.5], [0.5])
+])
 
-elif args.task == 'task_2_tumor_subtyping':
-    args.n_classes=3
-    dataset = Generic_MIL_Dataset(csv_path = 'dataset_csv/tumor_subtyping_dummy_clean.csv',
-                            data_dir= os.path.join(args.data_root_dir, 'tumor_subtyping_resnet_features'),
-                            shuffle = False, 
-                            print_info = True,
-                            label_dict = {'subtype_1':0, 'subtype_2':1, 'subtype_3':2},
-                            patient_strat= False,
-                            ignore=[])
+cnn = models.resnet50(pretrained=True)
+feat_dim = cnn.fc.in_features
+cnn.fc = nn.Identity()
+cnn.eval().to(device)
 
-# elif args.task == 'tcga_kidney_cv':
-#     args.n_classes=3
-#     dataset = Generic_MIL_Dataset(csv_path = 'dataset_csv/tcga_kidney_clean.csv',
-#                             data_dir= os.path.join(args.data_root_dir, 'tcga_kidney_20x_features'),
-#                             shuffle = False, 
-#                             print_info = True,
-#                             label_dict = {'TCGA-KICH':0, 'TCGA-KIRC':1, 'TCGA-KIRP':2},
-#                             patient_strat= False,
-#                             ignore=['TCGA-SARC'])
+preprocess_for_cnn = transforms.Compose([
+    transforms.Resize(224),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+])
 
-else:
-    raise NotImplementedError
+dataset = dataset = CLAM_MammoDataset(
+    data_dir=args.data_root_dir,
+    split='evaluation',
+    seg_sess=onnx_session,
+    pre_seg=preprocess_for_onnx,
+    cnn=cnn,
+    pre_cnn=preprocess_for_cnn,
+    feat_dim=args.embed_dim,
+    patch_size=64,
+    overlap=0,
+    coverage_thresh=0.5,
+    max_patches=1000,
+    shuffle=False,
+    device=device
+)
 
 if args.k_start == -1:
     start = 0
@@ -129,7 +136,7 @@ if __name__ == "__main__":
         else:
             csv_path = '{}/splits_{}.csv'.format(args.splits_dir, folds[ckpt_idx])
             datasets = dataset.return_splits(from_id=False, csv_path=csv_path)
-            split_dataset = datasets[datasets_id[args.split]]
+            split_dataset = dataset
         model, patient_results, test_error, auc, df  = eval(split_dataset, args, ckpt_paths[ckpt_idx])
         all_results.append(all_results)
         all_auc.append(auc)

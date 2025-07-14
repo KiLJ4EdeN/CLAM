@@ -1,9 +1,7 @@
 from __future__ import print_function
 
 import argparse
-import pdb
 import os
-import math
 
 # internal imports
 from utils.file_utils import save_pkl, load_pkl
@@ -29,7 +27,7 @@ preprocess_for_onnx = transforms.Compose([
 ])
 
 # patch CNN
-cnn = models.resnet50(pretrained=True) # 18 cuz memory, 50 default
+cnn = models.resnet18(pretrained=True) # 18 cuz memory, 50 default
 feat_dim = cnn.fc.in_features
 cnn.fc = nn.Identity()
 cnn.eval().to(device)
@@ -204,34 +202,6 @@ args.n_classes=2
 args.k = 1
 args.k_start = 0
 args.k_end = 1
-
-# if args.task == 'task_1_tumor_vs_normal':
-#     args.n_classes=2
-#     dataset = Generic_MIL_Dataset(csv_path = 'dataset_csv/tumor_vs_normal_dummy_clean.csv',
-#                             data_dir= os.path.join(args.data_root_dir, 'tumor_vs_normal_resnet_features'),
-#                             shuffle = False, 
-#                             seed = args.seed, 
-#                             print_info = True,
-#                             label_dict = {'normal_tissue':0, 'tumor_tissue':1},
-#                             patient_strat=False,
-#                             ignore=[])
-
-# elif args.task == 'task_2_tumor_subtyping':
-#     args.n_classes=3
-#     dataset = Generic_MIL_Dataset(csv_path = 'dataset_csv/tumor_subtyping_dummy_clean.csv',
-#                             data_dir= os.path.join(args.data_root_dir, 'tumor_subtyping_resnet_features'),
-#                             shuffle = False, 
-#                             seed = args.seed, 
-#                             print_info = True,
-#                             label_dict = {'subtype_1':0, 'subtype_2':1, 'subtype_3':2},
-#                             patient_strat= False,
-#                             ignore=[])
-
-#     if args.model_type in ['clam_sb', 'clam_mb']:
-#         assert args.subtyping 
-        
-# else:
-#     raise NotImplementedError
     
 if not os.path.isdir(args.results_dir):
     os.mkdir(args.results_dir)
@@ -239,16 +209,6 @@ if not os.path.isdir(args.results_dir):
 args.results_dir = os.path.join(args.results_dir, str(args.exp_code) + '_s{}'.format(args.seed))
 if not os.path.isdir(args.results_dir):
     os.mkdir(args.results_dir)
-
-# if args.split_dir is None:
-#     args.split_dir = os.path.join('splits', args.task+'_{}'.format(int(args.label_frac*100)))
-# else:
-#     args.split_dir = os.path.join('splits', args.split_dir)
-
-# print('split_dir: ', args.split_dir)
-# assert os.path.isdir(args.split_dir)
-
-# settings.update({'split_dir': args.split_dir})
 
 
 with open(args.results_dir + '/experiment_{}.txt'.format(args.exp_code), 'w') as f:
@@ -263,5 +223,3 @@ if __name__ == "__main__":
     results = main(args)
     print("finished!")
     print("end script")
-
-
