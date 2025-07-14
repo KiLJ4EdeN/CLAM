@@ -250,3 +250,42 @@ class CLAM_MB(CLAM_SB):
         if return_features:
             results_dict.update({'features': M})
         return logits, Y_prob, Y_hat, A_raw, results_dict
+
+
+if __name__ == "__main__":
+    # === Dummy Data ===
+    num_instances = 50       # e.g., 50 image patches
+    embed_dim = 1024         # feature dimension of each patch
+    dummy_data = torch.randn(num_instances, embed_dim)  # [N, embed_dim]
+
+    dummy_label = torch.tensor(1)  # class label (for instance_eval)
+
+    # === Model Initialization ===
+    model = CLAM_SB(
+        gate=True,
+        size_arg="small",
+        dropout=0.25,
+        k_sample=8,
+        n_classes=2,
+        instance_loss_fn=torch.nn.CrossEntropyLoss(),
+        subtyping=False,
+        embed_dim=embed_dim
+    )
+
+    # === Forward Pass ===
+    model.eval()
+    with torch.no_grad():
+        logits, probs, preds, A_raw, results = model(
+            dummy_data,
+            label=dummy_label,
+            instance_eval=True,
+            return_features=True,
+            attention_only=False
+        )
+
+    # === Output ===
+    print("Logits:", logits)
+    print("Predicted Class:", preds.item())
+    print("Class Probabilities:", probs)
+    print("Attention Raw Scores:", A_raw)
+    print("Instance Eval Results:", results)

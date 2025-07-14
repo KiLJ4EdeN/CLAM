@@ -13,12 +13,91 @@ from dataset_modules.dataset_generic import Generic_WSI_Classification_Dataset, 
 
 # pytorch imports
 import torch
-from torch.utils.data import DataLoader, sampler
-import torch.nn as nn
-import torch.nn.functional as F
-
 import pandas as pd
 import numpy as np
+import os
+from glob import glob
+import random
+import torch
+from torch.utils.data import Dataset
+from PIL import Image
+import numpy as np
+from torchvision import transforms
+
+class CLAM_MammoDataset(Dataset):
+    def __init__(self, data_dir, split, seg_sess, pre_seg, cnn, pre_cnn,
+                 feat_dim=1024, patch_size=64, overlap=0., coverage_thresh=0.5,
+                 max_patches=None, shuffle=True, device='cpu'):
+
+        self.seg = seg_sess
+        self.pre_seg = pre_seg
+        self.cnn = cnn.to(device).eval()
+        self.pre_cnn = pre_cnn
+        self.device = device
+        self.feat_dim = feat_dim
+        self.patch_size = patch_size
+        self.stride = patch_size - int(overlap * patch_size)
+        self.coverage_thresh = coverage_thresh
+        self.max_patches = max_patches
+        self.shuffle = shuffle
+
+        self.data_dir = data_dir
+        exts = ('.png', '.jpg', '.jpeg', '.tif', '.tiff')
+        self.slides = sorted([
+            p for p in glob(os.path.join(data_dir, 'images', split, '*.*'))
+            if p.lower().endswith(exts)
+        ])
+
+    def __len__(self):
+        return len(self.slides)
+
+    def __getitem__(self, idx):
+        path = self.slides[idx]
+
+        # --- Infer label ---
+        lbl_path = path.replace('images', 'labels').rsplit('.', 1)[0] + '.txt'
+        label = 1 if os.path.exists(lbl_path) and os.path.getsize(lbl_path) > 0 else 0
+        label = torch.tensor(label).long()
+
+        # --- Load image ---
+        img = Image.open(path).convert('RGB')
+        gray = img.convert('L')
+        w, h = gray.size
+
+        # --- Skip bad slides ---
+        if w >= h or (min(w, h) < 512 and max(w, h) < 1000):
+            return torch.zeros((0, self.feat_dim)), label
+
+        # --- Segmentation mask ---
+        inp = self.pre_seg(gray).unsqueeze(0).numpy()
+        out = self.seg.run(None, {'input': inp})[0]
+        prob = torch.from_numpy(out[0])
+        mask = (prob.sigmoid() > 0.5).float()
+        mask = transforms.ToPILImage()(mask).resize((w, h), Image.NEAREST)
+        mask = np.array(mask) > 0
+
+        # --- Extract valid patch coords ---
+        coords = [
+            (x, y)
+            for y in range(0, h - self.patch_size + 1, self.stride)
+            for x in range(0, w - self.patch_size + 1, self.stride)
+            if mask[y:y + self.patch_size, x:x + self.patch_size].mean() >= self.coverage_thresh
+        ]
+        if self.shuffle:
+            random.shuffle(coords)
+        if self.max_patches and len(coords) > self.max_patches:
+            coords = coords[:self.max_patches]
+        if not coords:
+            return torch.zeros((0, self.feat_dim)), label
+
+        # --- Patch and encode ---
+        patches = [self.pre_cnn(img.crop((x, y, x + self.patch_size, y + self.patch_size))) for x, y in coords]
+        batch = torch.stack(patches, dim=0).to(self.device)
+
+        with torch.no_grad():
+            features = self.cnn(batch)
+
+        return features.cpu(), label
 
 
 def main(args):
@@ -39,13 +118,82 @@ def main(args):
     all_val_auc = []
     all_test_acc = []
     all_val_acc = []
+    # folds = np.arange(start, end)
+    # for i in folds:
+    #     seed_torch(args.seed)
+    #     train_dataset, val_dataset, test_dataset = dataset.return_splits(from_id=False, 
+    #             csv_path='{}/splits_{}.csv'.format(args.split_dir, i))
+        
+    #     datasets = (train_dataset, val_dataset, test_dataset)
+    #     results, test_auc, val_auc, test_acc, val_acc  = train(datasets, i, args)
+    #     all_test_auc.append(test_auc)
+    #     all_val_auc.append(val_auc)
+    #     all_test_acc.append(test_acc)
+    #     all_val_acc.append(val_acc)
+    #     #write results to pkl
+    #     filename = os.path.join(args.results_dir, 'split_{}_results.pkl'.format(i))
+    #     save_pkl(filename, results)
+
     folds = np.arange(start, end)
     for i in folds:
         seed_torch(args.seed)
-        train_dataset, val_dataset, test_dataset = dataset.return_splits(from_id=False, 
-                csv_path='{}/splits_{}.csv'.format(args.split_dir, i))
+        # segmentation ONNX session
+        import onnxruntime as ort
+        from torchvision import transforms, models
+        onnx_session = ort.InferenceSession(
+            "/home/parsa/preprocessing-changes-object/mg-cancer-experimentation/clam/segmentation.onnx",
+            providers=['CUDAExecutionProvider', 'CPUExecutionProvider']
+        )
+        preprocess_for_onnx = transforms.Compose([
+            transforms.Resize((256,256)),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5],[0.5])
+        ])
+
+        # patch CNN
+        cnn = models.resnet50(pretrained=True) # 18 cuz memory, 50 default
+        feat_dim = cnn.fc.in_features
+        cnn.fc = nn.Identity()
+        cnn.eval().to(device)
+
+        preprocess_for_cnn = transforms.Compose([
+            transforms.Resize(224),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
+        ])
+        data_root_dir = '/home/parsa/preprocessing-changes-object/mg-cancer-experimentation/yolo_masks_nocbis_ncrop'
+        train_dataset = CLAM_MammoDataset(
+            data_dir=data_root_dir,
+            split='training',
+            seg_sess=onnx_session,
+            pre_seg=preprocess_for_onnx,
+            cnn=cnn,
+            pre_cnn=preprocess_for_cnn,
+            feat_dim=args.embed_dim,
+            patch_size=64,
+            overlap=0,
+            coverage_thresh=0.5,
+            max_patches=1000,
+            shuffle=True,
+            device=device
+        )
+        val_dataset = CLAM_MammoDataset(
+            data_dir=data_root_dir,
+            split='training',
+            seg_sess=onnx_session,
+            pre_seg=preprocess_for_onnx,
+            cnn=cnn,
+            pre_cnn=preprocess_for_cnn,
+            feat_dim=args.embed_dim,
+            patch_size=64,
+            overlap=0,
+            coverage_thresh=0.5,
+            max_patches=1000,
+            shuffle=True,
+            device=device
+        )
         
-        datasets = (train_dataset, val_dataset, test_dataset)
+        datasets = (train_dataset, val_dataset, val_dataset)
         results, test_auc, val_auc, test_acc, val_acc  = train(datasets, i, args)
         all_test_auc.append(test_auc)
         all_val_auc.append(val_auc)
@@ -152,33 +300,38 @@ if args.model_type in ['clam_sb', 'clam_mb']:
 
 print('\nLoad Dataset')
 
-if args.task == 'task_1_tumor_vs_normal':
-    args.n_classes=2
-    dataset = Generic_MIL_Dataset(csv_path = 'dataset_csv/tumor_vs_normal_dummy_clean.csv',
-                            data_dir= os.path.join(args.data_root_dir, 'tumor_vs_normal_resnet_features'),
-                            shuffle = False, 
-                            seed = args.seed, 
-                            print_info = True,
-                            label_dict = {'normal_tissue':0, 'tumor_tissue':1},
-                            patient_strat=False,
-                            ignore=[])
+args.n_classes=2
+args.k = 1
+args.k_start = 0
+args.k_end = 1
 
-elif args.task == 'task_2_tumor_subtyping':
-    args.n_classes=3
-    dataset = Generic_MIL_Dataset(csv_path = 'dataset_csv/tumor_subtyping_dummy_clean.csv',
-                            data_dir= os.path.join(args.data_root_dir, 'tumor_subtyping_resnet_features'),
-                            shuffle = False, 
-                            seed = args.seed, 
-                            print_info = True,
-                            label_dict = {'subtype_1':0, 'subtype_2':1, 'subtype_3':2},
-                            patient_strat= False,
-                            ignore=[])
+# if args.task == 'task_1_tumor_vs_normal':
+#     args.n_classes=2
+#     dataset = Generic_MIL_Dataset(csv_path = 'dataset_csv/tumor_vs_normal_dummy_clean.csv',
+#                             data_dir= os.path.join(args.data_root_dir, 'tumor_vs_normal_resnet_features'),
+#                             shuffle = False, 
+#                             seed = args.seed, 
+#                             print_info = True,
+#                             label_dict = {'normal_tissue':0, 'tumor_tissue':1},
+#                             patient_strat=False,
+#                             ignore=[])
 
-    if args.model_type in ['clam_sb', 'clam_mb']:
-        assert args.subtyping 
+# elif args.task == 'task_2_tumor_subtyping':
+#     args.n_classes=3
+#     dataset = Generic_MIL_Dataset(csv_path = 'dataset_csv/tumor_subtyping_dummy_clean.csv',
+#                             data_dir= os.path.join(args.data_root_dir, 'tumor_subtyping_resnet_features'),
+#                             shuffle = False, 
+#                             seed = args.seed, 
+#                             print_info = True,
+#                             label_dict = {'subtype_1':0, 'subtype_2':1, 'subtype_3':2},
+#                             patient_strat= False,
+#                             ignore=[])
+
+#     if args.model_type in ['clam_sb', 'clam_mb']:
+#         assert args.subtyping 
         
-else:
-    raise NotImplementedError
+# else:
+#     raise NotImplementedError
     
 if not os.path.isdir(args.results_dir):
     os.mkdir(args.results_dir)
@@ -187,15 +340,15 @@ args.results_dir = os.path.join(args.results_dir, str(args.exp_code) + '_s{}'.fo
 if not os.path.isdir(args.results_dir):
     os.mkdir(args.results_dir)
 
-if args.split_dir is None:
-    args.split_dir = os.path.join('splits', args.task+'_{}'.format(int(args.label_frac*100)))
-else:
-    args.split_dir = os.path.join('splits', args.split_dir)
+# if args.split_dir is None:
+#     args.split_dir = os.path.join('splits', args.task+'_{}'.format(int(args.label_frac*100)))
+# else:
+#     args.split_dir = os.path.join('splits', args.split_dir)
 
-print('split_dir: ', args.split_dir)
-assert os.path.isdir(args.split_dir)
+# print('split_dir: ', args.split_dir)
+# assert os.path.isdir(args.split_dir)
 
-settings.update({'split_dir': args.split_dir})
+# settings.update({'split_dir': args.split_dir})
 
 
 with open(args.results_dir + '/experiment_{}.txt'.format(args.exp_code), 'w') as f:

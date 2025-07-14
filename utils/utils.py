@@ -52,7 +52,7 @@ def get_split_loader(split_dataset, training = False, testing = False, weighted 
 	"""
 		return either the validation loader or training loader 
 	"""
-	kwargs = {'num_workers': 4} if device.type == "cuda" else {}
+	kwargs = {'num_workers': 0} if device.type == "cuda" else {}
 	if not testing:
 		if training:
 			if weighted:
