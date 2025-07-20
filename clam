@@ -1,0 +1,5 @@
+class 0 clustering acc 0.998695321611527: correct 541189/541896
+class 1 clustering acc 0.9991769638454612: correct 541450/541896
+Epoch: 0, train_loss: 0.6315, train_clustering_loss:  0.0067, train_error: 0.3699
+class 0: acc 0.6603291213635027, correct 22471/34030
+class 1: acc 0.5995490550924141, correct 20209/33707
